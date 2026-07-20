@@ -602,3 +602,5 @@ Calico GlobalNetworkPolicy
 BGP/VXLAN
     ↓
 tcpdump-based troubleshooting
+## https://www.cni.dev/docs/
+## https://oneuptime.com/blog/post/2026-02-09-pod-network-cidr-per-node/view
