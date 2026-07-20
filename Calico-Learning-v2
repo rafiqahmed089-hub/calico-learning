@@ -1,0 +1,604 @@
+Kubernetes CNI & Calico Crash Course
+
+I’m treating CNI as Kubernetes Container Network Interface and Calico as Project Calico.
+
+1. What is CNI?
+
+CNI is not itself a network. It is a standard interface used by container runtimes such as containerd or CRI-O to call networking plugins. The plugin creates the pod interface, assigns an IP address, configures routes and removes those resources when the pod is deleted. Kubernetes requires a compatible CNI plugin to implement pod networking.
+
+Think of it like this:
+
+Kubernetes
+    ↓
+Kubelet
+    ↓
+Container Runtime: containerd / CRI-O
+    ↓
+CNI specification
+    ↓
+Calico / Cilium / Flannel / AWS VPC CNI
+    ↓
+Linux networking
+CNI lifecycle
+
+When a pod is created:
+
+1. Kubelet asks containerd to create the pod sandbox.
+2. Containerd creates the network namespace.
+3. Containerd calls the CNI plugin with CNI_COMMAND=ADD.
+4. CNI creates the pod interface.
+5. IPAM assigns an IP address.
+6. Routes and networking rules are installed.
+7. The plugin returns the result to containerd.
+8. The pod containers start.
+
+When the pod is removed, the runtime calls the plugin with CNI_COMMAND=DEL. Current CNI operations include ADD, DEL, CHECK, GC, and VERSION; parameters such as the container ID, network namespace and interface name are passed through environment variables.
+
+Common Linux locations are:
+
+/etc/cni/net.d/     CNI configuration files
+/opt/cni/bin/       CNI plugin binaries
+
+These are common defaults; the container runtime ultimately controls the configured paths.
+
+2. What is Calico?
+
+Calico provides:
+
+Pod networking
+IP address management
+Kubernetes NetworkPolicy enforcement
+Calico-specific security policies
+BGP-based routing
+VXLAN and IP-in-IP overlays
+iptables, nftables and eBPF data planes
+Network observability
+
+Calico can act as the complete CNI, IPAM and policy solution, or it can provide only network policy while another plugin—such as AWS VPC CNI—handles pod networking.
+
+The most important Calico components
+Component	Purpose
+Calico CNI	Connects a pod to the node network
+Calico IPAM	Allocates pod IP addresses
+Felix	Programs routes and security rules on every node
+BIRD	Advertises pod routes using BGP
+confd	Builds BIRD configuration from Calico data
+kube-controllers	Synchronizes Kubernetes objects with Calico
+Typha	Reduces API/datastore load in larger clusters
+Tigera Operator	Installs and manages Calico components
+Calico API server	Exposes Calico resources through kubectl
+calicoctl	Administrative CLI for Calico resources
+
+Felix is the main node agent. It manages interfaces, kernel routes, access-control rules and node networking state. BIRD is needed when Calico uses BGP route distribution; it is not required for every deployment mode.
+
+3. How Calico connects a pod
+
+Calico normally creates a veth pair:
+
+Pod network namespace                   Node network namespace
+
++-------------------------+             +-----------------------------+
+| Pod                     |             | Kubernetes node             |
+|                         |             |                             |
+| eth0  192.168.10.5      |-------------| caliXXXXXXXX                 |
+|        veth end         |  veth pair  | host-side veth              |
++-------------------------+             |                             |
+                                        | Linux routing table         |
+                                        | Felix security rules        |
+                                        +-----------------------------+
+
+Unlike bridge-based implementations, Calico primarily uses Layer 3 routing. The host-side interface usually starts with cali, and Linux routes packets toward the appropriate pod interface.
+
+Inspect it with:
+
+kubectl get pods -A -o wide
+
+ip link show
+ip addr show
+ip route show
+
+ip link show | grep cali
+ip route | grep 192.168
+4. Calico networking modes
+A. VXLAN overlay
+Pod packet
+   ↓
+Encapsulated inside VXLAN
+   ↓
+Transferred between node IP addresses
+   ↓
+Decapsulated on destination node
+   ↓
+Destination pod
+
+Use VXLAN when the physical network does not know how to route pod IP addresses. It is generally the easiest portable option for cloud, lab and mixed network environments. VXLAN-only Calico networking does not require BGP unless routes must also be advertised to external BGP peers.
+
+B. IP-in-IP overlay
+
+Similar to VXLAN, but the pod packet is placed inside another IP packet. Calico’s IP-in-IP networking normally uses BGP between nodes for route distribution and supports IPv4 rather than IPv6.
+
+C. BGP without encapsulation
+
+Each node advertises routes for its pod addresses:
+
+Node 1: 192.168.1.0/24
+Node 2: 192.168.2.0/24
+Node 3: 192.168.3.0/24
+
+The resulting data path is efficient because packets are routed directly without overlay headers. However, the underlying network or routers must accept and route the pod CIDRs. Calico supports node-to-node BGP mesh and external BGP peers such as top-of-rack routers.
+
+D. Cross-subnet overlay
+Same subnet       → Direct routing
+Different subnet  → VXLAN or IP-in-IP encapsulation
+
+This reduces encapsulation while avoiding the need to teach the whole physical network about pod routes.
+
+Simple selection guide
+Environment	Practical starting choice
+Local Kind/Minikube lab	VXLAN
+Unknown physical network	VXLAN
+On-prem with BGP-capable routers	BGP, no overlay
+Several Layer 2 subnets	VXLAN CrossSubnet
+EKS using native VPC pod addresses	AWS VPC CNI + Calico policy
+Maximum Linux performance	Consider Calico eBPF
+5. Calico IPAM
+
+Calico IPAM assigns IP addresses from IPPool resources. Pools are divided into smaller blocks that are associated with nodes, allowing IP allocation to grow dynamically rather than reserving a fixed large subnet for every node.
+
+Check IP pools:
+
+kubectl get ippools.projectcalico.org
+
+kubectl get ippools.projectcalico.org -o yaml
+
+Using calicoctl:
+
+calicoctl get ippool -o wide
+calicoctl ipam show
+calicoctl ipam show --show-blocks
+
+A typical pool looks like:
+
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-ipv4-ippool
+spec:
+  cidr: 192.168.0.0/16
+  blockSize: 26
+  natOutgoing: true
+  nodeSelector: all()
+  vxlanMode: CrossSubnet
+  ipipMode: Never
+
+Important fields:
+
+Field	Meaning
+cidr	Address range assigned to pods
+blockSize	Smaller allocation block handed to a node
+natOutgoing	SNAT pod traffic going outside the pool
+vxlanMode	Never, Always, or CrossSubnet
+ipipMode	Never, Always, or CrossSubnet
+nodeSelector	Nodes allowed to use this pool
+
+Do not casually modify a production pool after pods have already received addresses. Pool migration should be planned so existing workloads can be recreated safely.
+
+6. Kubernetes NetworkPolicy vs Calico Policy
+Kubernetes NetworkPolicy
+
+Kubernetes NetworkPolicy is:
+
+Namespace-scoped
+Applied to pods selected by labels
+Additive
+Primarily allow-list based
+Split into ingress and egress
+Enforced only when the CNI supports NetworkPolicy
+
+A pod is open by default. Once an ingress or egress policy selects it, traffic in that direction becomes isolated and only explicitly allowed traffic passes.
+
+Namespace default deny
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+Apply:
+
+kubectl apply -f default-deny.yaml
+
+This also blocks DNS egress unless DNS is separately allowed.
+
+Allow frontend to backend on port 8080
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+
+  policyTypes:
+    - Ingress
+
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+Calico NetworkPolicy
+
+Calico extends Kubernetes policies with capabilities such as:
+
+Explicit Allow, Deny, Log and Pass actions
+Policy ordering
+Global policies
+Host endpoint policies
+Service-account selectors
+Advanced selectors
+CIDR and network-set controls
+
+Calico’s namespaced NetworkPolicy applies within a namespace, while GlobalNetworkPolicy can apply across namespaces and to other endpoint types.
+
+Calico explicit deny example
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: restrict-sensitive-workloads
+spec:
+  order: 100
+  selector: security == "restricted"
+  types:
+    - Egress
+
+  egress:
+    - action: Deny
+
+Policies with lower numeric order values are evaluated earlier. Design policy ordering carefully; an incorrect global deny can interrupt cluster traffic.
+
+7. Hands-on Kind + Calico lab
+
+The current Calico Open Source documentation identifies the 3.32 release line as latest and provides an operator-based Kind quickstart.
+
+Requirements
+
+Install:
+
+Docker
+kind
+kubectl
+Step 1: Create a Kind cluster without the default CNI
+
+Create config.yaml:
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16
+
+Create the cluster:
+
+kind create cluster \
+  --name calico-cluster \
+  --config config.yaml
+
+Initially, the nodes may show NotReady because no CNI has configured networking yet.
+
+kubectl get nodes -o wide
+Step 2: Install Calico
+kubectl create -f \
+https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/v1_crd_projectcalico_org.yaml
+
+kubectl create -f \
+https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/tigera-operator.yaml
+
+kubectl create -f \
+https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/custom-resources.yaml
+
+These commands follow the current official quickstart; pin the version rather than blindly installing an unversioned manifest in production.
+
+Monitor installation:
+
+watch kubectl get tigerastatus
+
+Check components:
+
+kubectl get pods -n tigera-operator
+kubectl get pods -n calico-system -o wide
+kubectl get nodes
+Step 3: Create test applications
+kubectl create namespace quickstart
+
+kubectl create deployment nginx \
+  --namespace quickstart \
+  --image nginx
+
+kubectl expose deployment nginx \
+  --namespace quickstart \
+  --port 80
+
+Start a client:
+
+kubectl run access \
+  --namespace quickstart \
+  --rm -it \
+  --image busybox \
+  --labels="app=client" \
+  -- /bin/sh
+
+Inside the pod:
+
+wget -qO- http://nginx
+nslookup nginx
+ip addr
+ip route
+
+This follows the official Calico connectivity test pattern.
+
+8. Essential Calico commands
+Installation status
+kubectl get tigerastatus
+kubectl get pods -n calico-system -o wide
+kubectl get daemonsets -n calico-system
+kubectl get deployments -n calico-system
+
+For manifest-based installations, Calico components may be in kube-system rather than calico-system.
+
+Configuration
+kubectl get installations.operator.tigera.io -o yaml
+
+kubectl get felixconfigurations.projectcalico.org -o yaml
+
+kubectl get ippools.projectcalico.org -o yaml
+
+kubectl get bgpconfigurations.projectcalico.org -o yaml
+
+kubectl get bgppeers.projectcalico.org -o yaml
+Policies
+kubectl get networkpolicy -A
+
+kubectl get networkpolicies.projectcalico.org -A
+
+kubectl get globalnetworkpolicies.projectcalico.org
+
+Using calicoctl:
+
+calicoctl get networkpolicy --all-namespaces -o wide
+calicoctl get globalnetworkpolicy -o wide
+calicoctl get workloadendpoint --all-namespaces
+
+Calico recommends matching the calicoctl version with the installed Calico version. New operator installations can also include the Calico API server, allowing many Calico resources to be managed using kubectl.
+
+9. CNI and Calico troubleshooting workflow
+
+Follow the packet from Kubernetes downward rather than randomly restarting components.
+
+Level 1: Is the pod sandbox failing?
+kubectl describe pod <pod-name> -n <namespace>
+
+Look for messages such as:
+
+FailedCreatePodSandBox
+networkPlugin cni failed
+plugin type="calico" failed
+failed to assign an IP address
+connection is unauthorized
+Level 2: Is the node ready?
+kubectl get nodes
+kubectl describe node <node-name>
+
+Common condition:
+
+NetworkPluginNotReady
+cni plugin not initialized
+Level 3: Is Calico running on the node?
+kubectl get pods -n calico-system -o wide
+
+kubectl logs -n calico-system \
+  <calico-node-pod> \
+  -c calico-node
+
+Previous container logs:
+
+kubectl logs -n calico-system \
+  <calico-node-pod> \
+  -c calico-node \
+  --previous
+
+Operator logs:
+
+kubectl logs -n tigera-operator \
+  deployment/tigera-operator
+Level 4: Check the CNI files on the node
+sudo ls -lah /etc/cni/net.d/
+sudo ls -lah /opt/cni/bin/
+
+sudo cat /etc/cni/net.d/*calico*
+
+Verify that the configuration exists and the referenced binaries are installed.
+
+Level 5: Check container runtime and kubelet logs
+sudo journalctl -u kubelet --since "30 minutes ago"
+
+sudo journalctl -u containerd --since "30 minutes ago"
+
+Filter:
+
+sudo journalctl -u kubelet | grep -Ei "cni|network|sandbox|calico"
+Level 6: Check pod IP allocation
+kubectl get pods -A -o wide
+
+kubectl get ippools.projectcalico.org -o yaml
+
+calicoctl ipam show
+calicoctl ipam show --show-blocks
+
+Check for:
+
+Exhausted IP pools
+Pool selector not matching the node
+Pod CIDR overlap
+Node using an incorrect IP address
+Disabled pool
+Block affinity problems
+Level 7: Check routing
+
+On the source node:
+
+ip route
+ip rule
+ip neigh
+
+For Calico interfaces:
+
+ip link show | grep cali
+ip route | grep cali
+
+For BGP mode:
+
+calicoctl node status
+
+Check whether peers show:
+
+Established
+
+A BGP session that is Idle, Active or repeatedly reconnecting usually indicates addressing, firewall, ASN or peering configuration problems.
+
+Level 8: Check policy
+kubectl get networkpolicy -A
+kubectl get globalnetworkpolicies.projectcalico.org
+
+Check the pod labels:
+
+kubectl get pod <pod> -n <namespace> --show-labels
+
+A policy may be valid but select the wrong pod because of an incorrect label.
+
+Level 9: Capture packets
+
+Find the source and destination pods:
+
+kubectl get pods -A -o wide
+
+Capture on the node:
+
+sudo tcpdump -ni any host <pod-ip>
+
+Capture a particular port:
+
+sudo tcpdump -ni any \
+  host <pod-ip> and port 8080
+
+Useful interpretation:
+
+No packets leave source pod:
+    Pod, application, policy or local interface problem
+
+Packets leave source but not source node:
+    Source-node route or policy problem
+
+Packets reach destination node but not destination pod:
+    Destination route, veth or policy problem
+
+Request reaches destination but response does not return:
+    Reverse route, policy, NAT or asymmetric-routing problem
+10. Debugging inside a pod’s network namespace
+
+Get the pod sandbox:
+
+sudo crictl pods
+sudo crictl inspectp <sandbox-id>
+
+Find its PID and enter the network namespace:
+
+sudo nsenter -t <pid> -n ip addr
+sudo nsenter -t <pid> -n ip route
+sudo nsenter -t <pid> -n ss -lntup
+
+This lets you inspect the exact interfaces, routes and sockets visible to the pod.
+
+11. Calico data planes
+iptables
+
+The traditional Calico Linux data plane. Felix programs Linux routes and iptables rules, while kube-proxy commonly handles Kubernetes Service forwarding.
+
+Debug with:
+
+sudo iptables-save | grep cali
+sudo iptables -L -n -v
+sudo iptables -t nat -L -n -v
+nftables
+
+Calico supports an nftables data plane. It must be paired with kube-proxy in nftables mode, and Calico’s current documentation lists modern Linux kernel and nft requirements.
+
+Debug with:
+
+sudo nft list ruleset
+eBPF
+
+Calico eBPF can replace kube-proxy’s Service handling and implement networking and policy using programs attached to Linux kernel hooks. Its goals include lower latency, higher throughput and better source-IP preservation.
+
+Debug with:
+
+sudo bpftool prog show
+sudo bpftool map show
+sudo tc filter show dev <interface> ingress
+sudo tc filter show dev <interface> egress
+
+Do not enable eBPF merely because it sounds newer. First confirm kernel support, cloud compatibility and how kube-proxy is currently managed.
+
+12. Five concepts to remember
+1. CNI is a specification; Calico is an implementation.
+
+2. CNI creates pod connectivity.
+   NetworkPolicy controls which connectivity is allowed.
+
+3. Calico CNI creates interfaces.
+   Calico IPAM assigns addresses.
+   Felix programs routes and security rules.
+
+4. VXLAN/IPIP hide pod packets inside node packets.
+   BGP advertises real routes without necessarily encapsulating them.
+
+5. Troubleshoot in this order:
+   Pod → CNI → IPAM → interface → route → policy → packet capture.
+
+A strong practical learning sequence is:
+
+CNI lifecycle
+    ↓
+Linux namespaces and veth
+    ↓
+Pod IPAM
+    ↓
+Same-node pod traffic
+    ↓
+Cross-node pod traffic
+    ↓
+Kubernetes Services
+    ↓
+NetworkPolicy
+    ↓
+Calico GlobalNetworkPolicy
+    ↓
+BGP/VXLAN
+    ↓
+tcpdump-based troubleshooting
